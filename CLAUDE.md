@@ -28,9 +28,19 @@ default.
   with a self-owned frameless `Gtk.Window` (`TrayWindow`) that positions itself
   at the top-right of the primary monitor workarea via `Gdk.Monitor.get_workarea()`.
 - **`TrayWindow`** is a frameless, always-on-top, skip-taskbar window with a
-  dark rounded CSS background.  Each icon is a `Gtk.EventBox` + `Gtk.Image`
-  with opacity-based hover feedback.  `size-allocate` → `idle_add` keeps it
-  right-aligned as slots are added/removed.
+  dark CSS background and an orange border (`#c07820`) for visibility.  Each
+  icon is a `Gtk.EventBox` + `Gtk.Image` with opacity-based hover feedback.
+  `size-allocate` → `idle_add` keeps it right-aligned as slots are added/removed.
+- **Qubes OS quirk**: `Gdk.WindowTypeHint.DOCK` must be set before the window
+  is realised; `gdkwin.set_skip_taskbar_hint(True)` is called again in
+  `_on_map_event` on the mapped `GdkWindow` because qubes-gui-agent does not
+  forward window-type hints set pre-map to dom0, but it does forward WM-state
+  changes on a mapped window.  A `GLib.timeout_add(500, _reposition)` fires
+  500 ms after map to override dom0 XFWM4's smart-placement (which ignores the
+  initial `move()`).  A `configure-event` handler logs the actual position the
+  WM assigns.  The panel uses mouse-pointer monitor detection so it lands on
+  the active monitor in multi-monitor setups.  Minimum panel width is 80 px
+  (`_PANEL_MIN_W`) to prevent the window from becoming an invisible sliver.
 - **`HostTrayIcon`** owns the first slot (signal-bars icon); `TrayItem` owns
   subsequent slots (one per registered SNI app).
 - **`popup_at_pointer(event)`** is used for all menus (replaces the old
@@ -55,13 +65,19 @@ default.
 - Window positioning uses `Gdk.Monitor.get_workarea()` (respects panel struts)
   and `Gtk.Window.move()` — the latter is ignored on Wayland compositors.
   Future fix: use `gtk-layer-shell` for Wayland support.
-- Tested desktop: XFCE, X11, Fedora 43.  Confirmed `_NET_SYSTEM_TRAY_S0` was
-  absent, which is why `GtkStatusIcon` was silent.
+- Tested desktop: XFCE, X11, Fedora 43 inside Qubes OS VM.  Confirmed
+  `_NET_SYSTEM_TRAY_S0` was absent, which is why `GtkStatusIcon` was silent.
 - XFCE does not reliably activate `graphical-session.target`.  The service
   uses `PassEnvironment=DISPLAY XAUTHORITY` to forward display vars.  The
   XDG autostart `.desktop` file is installed alongside the service as the more
   reliable autostart mechanism for XFCE.  If both fire, the second instance
   exits immediately on the `NameExistsException` guard.
+- **Qubes window positioning**: dom0 XFWM4 applies smart-placement overriding
+  the initial `move()` call.  The 500 ms delayed `_reposition` call overrides
+  this.  The panel should appear at the top-right of the active monitor.  If
+  it doesn't, run `sni-host.py -v` and look for the "Panel placed by WM at"
+  log line to find the actual coordinates.  Try increasing the timeout if
+  500 ms is not enough for your Qubes dom0 to settle.
 
 ## Files
 

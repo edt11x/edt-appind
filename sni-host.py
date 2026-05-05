@@ -159,17 +159,21 @@ def _argb_pixmaps_to_pixbuf(pixmaps) -> GdkPixbuf.Pixbuf | None:
 _TRAY_CSS = b"""
 window#sni-host-tray {
     background-color: #1c1c1c;
-    border: 1px solid #484848;
+    border: 2px solid #c07820;
 }
 """
 
+# Minimum panel width so the window is never an invisible sliver.
+_PANEL_MIN_W = 80
+
+
 class TrayWindow(Gtk.Window):
     """
-    Frameless always-on-top panel at the top-right of the primary monitor's
-    workarea.  Icon slots are added/removed as items register/unregister.
+    Frameless always-on-top panel positioned at the top-right of the monitor
+    that currently holds the mouse pointer.
 
     Call show_panel() once after the initial icon slots are populated so the
-    window is mapped with content and positioned correctly on first paint.
+    window maps with content and is positioned correctly on first paint.
     """
 
     def __init__(self):
@@ -179,15 +183,13 @@ class TrayWindow(Gtk.Window):
         self.set_keep_above(True)
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
-        self.set_accept_focus(False)
-        self.set_focus_on_map(False)
+        self.set_accept_focus(True)
         self.set_resizable(False)
         self.stick()
         self.set_name('sni-host-tray')
-        # UTILITY: excluded from taskbar/pager by all major WMs; WM still
-        # honours move() unlike DOCK.  More reliable than skip_taskbar_hint.
-        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
-        # NONE: suppress WM smart-placement so our move() is the final word.
+        # DOCK is excluded from taskbars by every WM and by Qubes' dom0 XFWM4.
+        # set_type_hint must be called before the window is realized.
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
         self.set_position(Gtk.WindowPosition.NONE)
 
         provider = Gtk.CssProvider()
@@ -200,14 +202,16 @@ class TrayWindow(Gtk.Window):
         self._box.set_margin_end(PAD)
         self._box.set_margin_top(PAD)
         self._box.set_margin_bottom(PAD)
+        # Enforce a minimum width so the panel is never an invisible sliver.
+        self._box.set_size_request(_PANEL_MIN_W, ICON_SIZE + 2 * PAD)
         self.add(self._box)
 
         self._reposition_pending = False
-        # size-allocate fires whenever the box gains/loses a slot
-        self.connect('size-allocate', self._on_size_allocate)
-        # map-event fires once the window is actually on screen; use it for
-        # the very first position so we measure real allocated size, not 0×0
-        self.connect('map-event', self._on_map_event)
+        self._mapped = False
+        self.connect('size-allocate',  self._on_size_allocate)
+        self.connect('map-event',      self._on_map_event)
+        # configure-event reports the position the WM actually assigned.
+        self.connect('configure-event', self._on_configure_event)
 
     def show_panel(self):
         """Map the window.  Call after the host icon slot has been added."""
@@ -216,8 +220,29 @@ class TrayWindow(Gtk.Window):
     # --- layout / positioning ---
 
     def _on_map_event(self, _win, _event):
+        self._mapped = True
+        # Re-assert skip-taskbar as a WM-state change on the realised GdkWindow.
+        # In Qubes OS, window-type hints set before mapping are not forwarded to
+        # dom0 by qubes-gui-agent, but WM-state changes on a mapped window are.
+        gdkwin = self.get_window()
+        if gdkwin:
+            gdkwin.set_skip_taskbar_hint(True)
+            gdkwin.set_skip_pager_hint(True)
+        # First attempt: immediate reposition (may be overridden by WM smart-
+        # placement on first map, especially in Qubes).
         self._queue_reposition()
-        return False  # do not consume event
+        # Second attempt: after 500 ms the WM has finished its initial
+        # placement; this call overrides it reliably.
+        GLib.timeout_add(500, self._reposition)
+        return False
+
+    def _on_configure_event(self, _win, event):
+        # Log the position the WM actually assigned so the user knows where
+        # to look — especially useful in Qubes where move() is async.
+        if self._mapped:
+            log.info('Panel placed by WM at (%d, %d)  size %d×%d',
+                     event.x, event.y, event.width, event.height)
+        return False
 
     def _on_size_allocate(self, *_):
         self._queue_reposition()
@@ -230,13 +255,22 @@ class TrayWindow(Gtk.Window):
     def _reposition(self):
         self._reposition_pending = False
         display = Gdk.Display.get_default()
-        monitor = display.get_primary_monitor() or display.get_monitor(0)
-        wa      = monitor.get_workarea()
-        # get_allocated_width/height return the GTK content size even before
-        # the WM has acknowledged the ConfigureRequest, unlike get_size().
-        w = self.get_allocated_width()
-        h = self.get_allocated_height()
-        self.move(wa.x + wa.width - w - 5, wa.y + 5)
+
+        # Use the monitor that currently holds the mouse pointer.
+        seat    = display.get_default_seat()
+        pointer = seat.get_pointer()
+        _screen, px, py = pointer.get_position()
+        monitor = (display.get_monitor_at_point(px, py)
+                   or display.get_primary_monitor()
+                   or display.get_monitor(0))
+
+        wa = monitor.get_workarea()
+        w  = self.get_allocated_width()
+        h  = self.get_allocated_height()
+        x  = wa.x + wa.width - w - 5
+        y  = wa.y + 5
+        self.move(x, y)
+        log.debug('Requested panel position (%d, %d)  size %d×%d', x, y, w, h)
         return False
 
     # --- slot management ---
