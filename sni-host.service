@@ -1,13 +1,18 @@
 [Unit]
 Description=StatusNotifierItem Host (AppIndicator support for Dropbox)
+# graphical-session.target is set by GNOME/KDE session managers.
+# XFCE may not set it; the service will still start via WantedBy below,
+# but we wait for the DBus session bus to be ready as a minimum guard.
 After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
 Type=simple
+# Pass display vars explicitly in case the user environment is incomplete.
+PassEnvironment=DISPLAY XAUTHORITY XAUTHLOCALHOSTNAME
 ExecStart=%h/.local/bin/sni-host.py
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 
 [Install]
 WantedBy=graphical-session.target

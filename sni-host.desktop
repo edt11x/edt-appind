@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=sni-host
+Comment=StatusNotifierItem host — AppIndicator support for Dropbox and SNI apps
+Exec=%h/.local/bin/sni-host.py
+Icon=network-wireless
+Categories=Utility;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

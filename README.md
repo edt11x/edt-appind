@@ -55,14 +55,34 @@ sudo dnf install python3-gobject python3-dbus gtk3 libdbusmenu-gtk3 python3-cair
 bash install.sh
 ```
 
-This copies `sni-host.py` to `~/.local/bin/`, installs `sni-host.service`
-as a systemd user unit, and enables + starts it immediately.
+This installs three things:
+
+| Destination | Purpose |
+|---|---|
+| `~/.local/bin/sni-host.py` | The executable |
+| `~/.config/systemd/user/sni-host.service` | systemd user unit (enabled immediately) |
+| `~/.config/autostart/sni-host.desktop` | XDG autostart fallback for XFCE and other non-systemd sessions |
+
+Both the systemd service and the XDG autostart entry are installed.  If both
+fire at login, the second launch exits immediately because
+`org.kde.StatusNotifierWatcher` is already owned — no harm done.
 
 After installation restart Dropbox (or any SNI app) to pick up the watcher:
 
 ```bash
 dropbox stop && dropbox start
 ```
+
+### Will the panel window appear when running as a service?
+
+Yes — `DISPLAY` and `DBUS_SESSION_BUS_ADDRESS` are present in the systemd
+user environment.  The service uses `PassEnvironment=DISPLAY XAUTHORITY` to
+forward display credentials explicitly.
+
+> **XFCE note**: XFCE does not reliably activate `graphical-session.target`,
+> so the systemd service may start before the display is ready on some
+> machines.  The XDG autostart entry (`sni-host.desktop`) is the more
+> reliable trigger for XFCE sessions.
 
 ## Manual / one-shot run
 
@@ -76,9 +96,10 @@ dropbox stop && dropbox start
 
 | File | Purpose |
 |---|---|
-| `sni-host.py` | Main daemon (StatusNotifierWatcher DBus service + GTK tray host) |
+| `sni-host.py` | Main daemon (StatusNotifierWatcher DBus service + GTK panel window) |
 | `sni-host.service` | systemd user service unit |
-| `install.sh` | Installs the above and enables the service |
+| `sni-host.desktop` | XDG autostart entry (reliable fallback for XFCE) |
+| `install.sh` | Installs all of the above |
 
 ## Panel window and menu
 

@@ -57,13 +57,19 @@ default.
   Future fix: use `gtk-layer-shell` for Wayland support.
 - Tested desktop: XFCE, X11, Fedora 43.  Confirmed `_NET_SYSTEM_TRAY_S0` was
   absent, which is why `GtkStatusIcon` was silent.
+- XFCE does not reliably activate `graphical-session.target`.  The service
+  uses `PassEnvironment=DISPLAY XAUTHORITY` to forward display vars.  The
+  XDG autostart `.desktop` file is installed alongside the service as the more
+  reliable autostart mechanism for XFCE.  If both fire, the second instance
+  exits immediately on the `NameExistsException` guard.
 
 ## Files
 
 ```
 sni-host.py       Main daemon
-sni-host.service  systemd user unit
-install.sh        Installs to ~/.local/bin + systemd
+sni-host.service  systemd user unit (PassEnvironment=DISPLAY XAUTHORITY)
+sni-host.desktop  XDG autostart entry — reliable trigger for XFCE sessions
+install.sh        Installs all three + enables service
 README.md         User-facing docs
 CLAUDE.md         This file
 ```
