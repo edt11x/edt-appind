@@ -11,12 +11,12 @@ import logging
 import argparse
 import signal as _signal
 
+import time as _time
+
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
-gi.require_version('Dbusmenu', '0.4')
-gi.require_version('DbusmenuGtk3', '0.4')
-from gi.repository import Gtk, Gdk, GLib, GdkPixbuf, Dbusmenu, DbusmenuGtk3
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
 import cairo
 
 import dbus
@@ -123,8 +123,10 @@ def _make_fallback_pixbuf(size=ICON_SIZE) -> GdkPixbuf.Pixbuf:
     return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
 
 
-def _load_named_icon(name: str) -> GdkPixbuf.Pixbuf | None:
+def _load_named_icon(name: str, extra_path: str = '') -> GdkPixbuf.Pixbuf | None:
     theme = Gtk.IconTheme.get_default()
+    if extra_path and extra_path not in theme.get_search_path():
+        theme.prepend_search_path(extra_path)
     try:
         return theme.load_icon(name, ICON_SIZE, Gtk.IconLookupFlags.FORCE_SIZE)
     except GLib.Error:
@@ -470,9 +472,9 @@ class TrayItem:
         self._obj_path = obj_path
         self._app      = app
         self._tray     = tray
-        self._menu_client = None
-        self._proxy    = None
-        self._props    = None
+        self._menu_path = ''
+        self._proxy     = None
+        self._props     = None
 
         self._ebox, self._img = tray.add_slot(_make_fallback_pixbuf(), self._on_press)
         self._ebox.set_tooltip_text(bus_name)
@@ -497,9 +499,25 @@ class TrayItem:
             return default
 
     def _load_icon_pixbuf(self) -> GdkPixbuf.Pixbuf | None:
+        theme_path = str(self._get_prop('IconThemePath', '') or '')
+        status = str(self._get_prop('Status', 'Active') or 'Active')
+
+        # When the item needs attention, prefer the attention icon.
+        if status == 'NeedsAttention':
+            icon_name = str(self._get_prop('AttentionIconName', '') or '')
+            if icon_name:
+                pb = _load_named_icon(icon_name, theme_path)
+                if pb:
+                    return pb
+            pixmaps = self._get_prop('AttentionIconPixmap')
+            if pixmaps:
+                pb = _argb_pixmaps_to_pixbuf(pixmaps)
+                if pb:
+                    return pb
+
         icon_name = str(self._get_prop('IconName', '') or '')
         if icon_name:
-            pb = _load_named_icon(icon_name)
+            pb = _load_named_icon(icon_name, theme_path)
             if pb:
                 return pb
         pixmaps = self._get_prop('IconPixmap')
@@ -519,24 +537,74 @@ class TrayItem:
         log.debug('%s: icon refreshed', self._bus_name)
 
     def _refresh_menu(self):
-        menu_path = str(self._get_prop('Menu', '') or '')
-        if not menu_path:
-            return
+        self._menu_path = str(self._get_prop('Menu', '') or '')
+        log.debug('%s: Menu path = %r', self._bus_name, self._menu_path)
+
+    def _build_context_menu(self) -> Gtk.Menu | None:
+        """Fetch the item's menu via com.canonical.dbusmenu and return a Gtk.Menu."""
+        if not self._menu_path:
+            return None
         try:
-            self._menu_client = DbusmenuGtk3.Client.new(self._bus_name, menu_path)
+            obj   = self._bus.get_object(self._bus_name, self._menu_path)
+            iface = dbus.Interface(obj, 'com.canonical.dbusmenu')
+            try:
+                iface.AboutToShow(dbus.Int32(0))
+            except Exception:
+                pass
+            _rev, layout = iface.GetLayout(
+                dbus.Int32(0), dbus.Int32(-1), dbus.Array([], signature='s'))
+            _root_id, _root_props, children = layout
+            if not children:
+                log.debug('%s: dbusmenu returned no children', self._bus_name)
+                return None
+            return self._layout_to_gtk_menu(iface, children)
         except Exception as e:
-            log.warning('Menu client failed for %s: %s', self._bus_name, e)
+            log.warning('%s: dbusmenu GetLayout failed: %s', self._bus_name, e)
+            return None
+
+    def _layout_to_gtk_menu(self, iface, items) -> Gtk.Menu:
+        menu = Gtk.Menu()
+        for item_id, props, children in items:
+            if not bool(props.get('visible', True)):
+                continue
+            if str(props.get('type', '')) == 'separator':
+                menu.append(Gtk.SeparatorMenuItem())
+                continue
+            label   = str(props.get('label', '') or '')
+            enabled = bool(props.get('enabled', True))
+            mitem   = Gtk.MenuItem()
+            lbl     = Gtk.Label(label=label, xalign=0)
+            mitem.add(lbl)
+            mitem.set_sensitive(enabled)
+            if children:
+                mitem.set_submenu(self._layout_to_gtk_menu(iface, children))
+            else:
+                mid = int(item_id)
+                mitem.connect('activate',
+                              lambda _w, _id=mid: self._dbusmenu_activate(iface, _id))
+            menu.append(mitem)
+        menu.show_all()
+        return menu
+
+    def _dbusmenu_activate(self, iface, item_id: int):
+        try:
+            iface.Event(dbus.Int32(item_id), dbus.String('clicked'),
+                        dbus.Int32(0), dbus.UInt32(int(_time.time())))
+        except Exception as e:
+            log.debug('dbusmenu Event(clicked, id=%d) failed: %s', item_id, e)
 
     def _subscribe_signals(self):
         obj = self._bus.get_object(self._bus_name, self._obj_path)
-        obj.connect_to_signal('NewIcon',   self._on_new_icon,   dbus_interface=ITEM_IFACE)
-        obj.connect_to_signal('NewStatus', self._on_new_status, dbus_interface=ITEM_IFACE)
-        obj.connect_to_signal('NewTitle',  self._on_new_title,  dbus_interface=ITEM_IFACE)
+        obj.connect_to_signal('NewIcon',          self._on_new_icon,   dbus_interface=ITEM_IFACE)
+        obj.connect_to_signal('NewAttentionIcon', self._on_new_icon,   dbus_interface=ITEM_IFACE)
+        obj.connect_to_signal('NewStatus',        self._on_new_status, dbus_interface=ITEM_IFACE)
+        obj.connect_to_signal('NewTitle',         self._on_new_title,  dbus_interface=ITEM_IFACE)
 
     def _on_new_icon(self, *_):
         GLib.idle_add(self._refresh_icon)
 
     def _on_new_status(self, status, *_):
+        GLib.idle_add(self._refresh_icon)
         GLib.idle_add(self._ebox.set_visible, str(status) != 'Passive')
 
     def _on_new_title(self, *_):
@@ -546,21 +614,18 @@ class TrayItem:
     def _on_press(self, widget, event):
         if event.button == 1:
             try:
-                self._proxy.Activate(0, 0)
+                self._proxy.Activate(int(event.x_root), int(event.y_root))
             except Exception as e:
                 log.debug('Activate failed: %s', e)
         elif event.button == 3:
-            if self._menu_client:
-                root = self._menu_client.get_root()
-                if root:
-                    menu = self._menu_client.menuitem_get_submenu(root)
-                    if menu:
-                        menu.popup_at_pointer(event)
-                        return True
-            try:
-                self._proxy.ContextMenu(0, 0)
-            except Exception:
-                pass
+            menu = self._build_context_menu()
+            if menu:
+                menu.popup_at_pointer(event)
+            else:
+                try:
+                    self._proxy.ContextMenu(int(event.x_root), int(event.y_root))
+                except Exception as e:
+                    log.debug('ContextMenu failed: %s', e)
         return True
 
     def destroy(self):

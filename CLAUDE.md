@@ -12,9 +12,12 @@ default.
 - **GTK 3 / GtkStatusIcon** chosen over GTK 4 because `GtkStatusIcon` (the
   X11 system-tray embedding widget) was removed from GTK 4.  The program
   therefore depends on `gtk3`, not `gtk4`.
-- **`libdbusmenu-gtk3` / `DbusmenuGtk3`** used for context menus because
-  Dropbox exposes its menu via the `com.canonical.dbusmenu` protocol, not
-  plain `ContextMenu()`.
+- **`com.canonical.dbusmenu`** spoken directly via `dbus-python` for context
+  menus.  `DbusmenuGtk3.Client` was tried first but its asynchronous layout
+  fetch meant the menu had no items at click time.  `_build_context_menu()`
+  calls `AboutToShow(0)` then `GetLayout` synchronously on each right-click
+  and builds a `Gtk.Menu` in `_layout_to_gtk_menu()`; item activation sends
+  an `Event(id, 'clicked', …)` call back to the app.
 - **`python3-dbus` (dbus-python)** used instead of `dasbus` or `pydbus`
   because it is already installed on Fedora 43 and has stable `sender_keyword`
   support needed for SNI registration.
