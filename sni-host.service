@@ -1,0 +1,13 @@
+[Unit]
+Description=StatusNotifierItem Host (AppIndicator support for Dropbox)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sni-host.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
