@@ -14,10 +14,13 @@ Without this (or a GNOME Shell extension), Dropbox shows:
 
 1. Registers the well-known DBus name `org.kde.StatusNotifierWatcher`.
 2. Registers itself as `org.kde.StatusNotifierHost-<pid>`.
-3. When an SNI application (like Dropbox) calls `RegisterStatusNotifierItem`,
+3. **sni-host's own tray icon** — a black icon with three white signal bars
+   appears in the system tray.  Left-click or right-click opens a menu showing
+   version, PID, all registered items, and **Restart** / **Quit** actions.
+4. When an SNI application (like Dropbox) calls `RegisterStatusNotifierItem`,
    it creates a `GtkStatusIcon` in the X11 system tray using the app's icon
    and connects a `libdbusmenu-gtk3` context menu.
-4. Watches for `NewIcon` / `NewStatus` / `NewTitle` signals and updates the
+5. Watches for `NewIcon` / `NewStatus` / `NewTitle` signals and updates the
    tray icon live.
 
 ## Requirements
@@ -29,12 +32,13 @@ python3-gobject   (PyGObject / GI bindings)
 python3-dbus      (dbus-python)
 gtk3              (GtkStatusIcon)
 libdbusmenu-gtk3  (context-menu rendering)
+python3-cairo     (host icon drawing)
 ```
 
 Install them if missing:
 
 ```bash
-sudo dnf install python3-gobject python3-dbus gtk3 libdbusmenu-gtk3
+sudo dnf install python3-gobject python3-dbus gtk3 libdbusmenu-gtk3 python3-cairo
 ```
 
 ## Installation
@@ -67,6 +71,24 @@ dropbox stop && dropbox start
 | `sni-host.py` | Main daemon (StatusNotifierWatcher DBus service + GTK tray host) |
 | `sni-host.service` | systemd user service unit |
 | `install.sh` | Installs the above and enables the service |
+
+## sni-host tray menu
+
+Right-click (or left-click) the black signal-bars icon to open the menu:
+
+```
+sni-host  v1.0              ← bold header
+AppIndicator / SNI host daemon
+PID: 12345
+─────────────────────────
+Registered items: 1         ← live count
+  ●  :1.234                 ← one line per registered bus name
+─────────────────────────
+Restart                     ← replaces process in-place (os.execv)
+Quit
+```
+
+The tooltip on the icon shows the version and current item count.
 
 ## Limitations
 

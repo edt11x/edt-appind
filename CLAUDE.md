@@ -22,6 +22,11 @@ default.
   to RGBA before passing to `GdkPixbuf`.
 - The watcher exits with status 1 if `org.kde.StatusNotifierWatcher` is
   already owned (prevents duplicate instances).
+- **sni-host's own tray icon** is drawn with `cairo` (black bg, three white
+  rounded signal bars) via `Gdk.pixbuf_get_from_surface`.  Uses `HostTrayIcon`
+  class with a dynamically-built `Gtk.Menu` on each right/left-click.
+- **Restart** is implemented as `os.execv(sys.executable, [sys.executable] + sys.argv)`,
+  replacing the process in-place while preserving all CLI arguments.
 
 ## Known issues / next steps
 
@@ -35,6 +40,8 @@ default.
   reorder yet.
 - The `--verbose` / `-v` flag enables `DEBUG` logging for all modules; could
   be scoped more narrowly in future.
+- The host tray menu rebuilds from scratch on every open; acceptable for the
+  expected item count but could be optimized with incremental updates.
 
 ## Files
 
