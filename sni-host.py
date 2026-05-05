@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-sni-host: StatusNotifierItem host for X11/GNOME
-Provides org.kde.StatusNotifierWatcher on DBus and renders tray icons via GtkStatusIcon.
+sni-host: StatusNotifierItem host for X11
+Provides org.kde.StatusNotifierWatcher on DBus and renders tray icons in a
+self-owned frameless GTK window positioned at the top-right of the workarea.
 """
 
 import sys
@@ -22,7 +23,7 @@ import dbus
 import dbus.service
 import dbus.mainloop.glib
 
-VERSION = '1.0'
+VERSION = '1.1'
 
 log = logging.getLogger('sni-host')
 
@@ -31,14 +32,15 @@ def _parse_args():
     parser = argparse.ArgumentParser(
         prog='sni-host',
         description=(
-            'StatusNotifierItem host for X11/GNOME.\n\n'
+            'StatusNotifierItem host for X11.\n\n'
             'Registers org.kde.StatusNotifierWatcher on the session DBus so that\n'
-            'applications using the StatusNotifierItem protocol (e.g. Dropbox) can\n'
-            'display tray icons in the X11 system tray.\n\n'
-            'sni-host itself appears in the tray with a black icon and a right-click\n'
-            'menu showing registered items, a Restart option, and a Quit option.\n\n'
-            'Intended to run as a background daemon, typically via a systemd user\n'
-            'service (see sni-host.service).'
+            'applications using the StatusNotifierItem / AppIndicator protocol\n'
+            '(e.g. Dropbox) can display tray icons.\n\n'
+            'sni-host shows its own icon in a small frameless panel window at the\n'
+            'top-right corner of the primary monitor.  Left-click or right-click\n'
+            'the icon for a menu with app info, registered items, Restart, and Quit.\n\n'
+            'Intended to run as a background daemon via a systemd user service\n'
+            '(see sni-host.service).'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -62,140 +64,263 @@ HOST_BUS_PREFIX   = 'org.kde.StatusNotifierHost'
 
 PROPS_IFACE       = 'org.freedesktop.DBus.Properties'
 
-ICON_SIZE         = 22  # pixels
+ICON_SIZE = 22   # px, each icon square
+PAD       = 4    # px, padding around icon row inside panel window
+
+_HAND_CURSOR = None   # lazy-initialised Gdk.Cursor
+
+
+def _hand_cursor():
+    global _HAND_CURSOR
+    if _HAND_CURSOR is None:
+        _HAND_CURSOR = Gdk.Cursor.new_from_name(Gdk.Display.get_default(), 'pointer')
+    return _HAND_CURSOR
 
 
 # ---------------------------------------------------------------------------
-# Host icon drawing
+# Icon helpers
 # ---------------------------------------------------------------------------
 
 def _make_host_pixbuf(size=ICON_SIZE) -> GdkPixbuf.Pixbuf:
-    """Draw the sni-host tray icon: black background, three white signal bars."""
+    """Black background with three white rounded signal bars."""
     surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
     ctx = cairo.Context(surface)
 
-    # Black background
     ctx.set_source_rgb(0, 0, 0)
     ctx.rectangle(0, 0, size, size)
     ctx.fill()
 
-    # Three white vertical signal bars, bottom-aligned, rounded caps
     ctx.set_source_rgb(1, 1, 1)
     bar_w   = max(2, size // 8)
     gap     = max(1, size // 11)
     total_w = 3 * bar_w + 2 * gap
     x0      = (size - total_w) / 2
     bottom  = size - 2
-    fracs   = [0.35, 0.60, 0.85]  # bar heights as fraction of icon size
 
-    for i, frac in enumerate(fracs):
+    for i, frac in enumerate([0.35, 0.60, 0.85]):
         h  = size * frac
         bx = x0 + i * (bar_w + gap)
         by = bottom - h
         r  = bar_w / 2
-        # Rounded rectangle
         ctx.new_sub_path()
         ctx.arc(bx + r,          by + r,     r, -3.14159, -1.5708)
-        ctx.arc(bx + bar_w - r,  by + r,     r, -1.5708,  0)
-        ctx.arc(bx + bar_w - r,  by + h - r, r,  0,       1.5708)
-        ctx.arc(bx + r,          by + h - r, r,  1.5708,  3.14159)
+        ctx.arc(bx + bar_w - r,  by + r,     r, -1.5708,   0     )
+        ctx.arc(bx + bar_w - r,  by + h - r, r,  0,        1.5708)
+        ctx.arc(bx + r,          by + h - r, r,  1.5708,   3.14159)
         ctx.close_path()
         ctx.fill()
 
-    pb = Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
-    return pb
+    return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
+
+
+def _make_fallback_pixbuf(size=ICON_SIZE) -> GdkPixbuf.Pixbuf:
+    """Mid-gray filled square — used when an item provides no usable icon."""
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    ctx = cairo.Context(surface)
+    ctx.set_source_rgb(0.45, 0.45, 0.45)
+    ctx.rectangle(2, 2, size - 4, size - 4)
+    ctx.fill()
+    return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
+
+
+def _load_named_icon(name: str) -> GdkPixbuf.Pixbuf | None:
+    theme = Gtk.IconTheme.get_default()
+    try:
+        return theme.load_icon(name, ICON_SIZE, Gtk.IconLookupFlags.FORCE_SIZE)
+    except GLib.Error:
+        return None
+
+
+def _argb_pixmaps_to_pixbuf(pixmaps) -> GdkPixbuf.Pixbuf | None:
+    """Convert SNI ARGB pixmap list [(w, h, bytes), ...] to GdkPixbuf."""
+    best = None
+    for (w, h, data) in pixmaps:
+        w, h = int(w), int(h)
+        if w <= 0 or h <= 0:
+            continue
+        raw = bytes(data)
+        if len(raw) < w * h * 4:
+            continue
+        rgba = bytearray(len(raw))
+        for i in range(0, len(raw), 4):
+            a, r, g, b = raw[i], raw[i+1], raw[i+2], raw[i+3]
+            rgba[i] = r; rgba[i+1] = g; rgba[i+2] = b; rgba[i+3] = a
+        pb = GdkPixbuf.Pixbuf.new_from_data(
+            bytes(rgba), GdkPixbuf.Colorspace.RGB, True, 8, w, h, w * 4)
+        if best is None or w > best.get_width():
+            best = pb.copy()
+    return best
 
 
 # ---------------------------------------------------------------------------
-# Host tray icon (sni-host's own icon in the system tray)
+# Tray window  — the visible panel
+# ---------------------------------------------------------------------------
+
+_TRAY_CSS = b"""
+window#sni-host-tray {
+    background-color: #1c1c1c;
+    border-radius: 5px;
+    border: 1px solid #484848;
+}
+"""
+
+class TrayWindow(Gtk.Window):
+    """
+    Frameless always-on-top panel at the top-right of the primary monitor's
+    workarea.  Icon slots are added/removed as items register/unregister.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.set_title('sni-host')
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_accept_focus(False)
+        self.set_resizable(False)
+        self.stick()
+        self.set_name('sni-host-tray')
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(_TRAY_CSS)
+        self.get_style_context().add_provider(
+            provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self._box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        self._box.set_margin_start(PAD)
+        self._box.set_margin_end(PAD)
+        self._box.set_margin_top(PAD)
+        self._box.set_margin_bottom(PAD)
+        self.add(self._box)
+
+        self._reposition_pending = False
+        self.connect('size-allocate', self._on_size_allocate)
+
+        self.show_all()
+        self._queue_reposition()
+
+    # --- layout / positioning ---
+
+    def _on_size_allocate(self, *_):
+        self._queue_reposition()
+
+    def _queue_reposition(self):
+        if not self._reposition_pending:
+            self._reposition_pending = True
+            GLib.idle_add(self._reposition)
+
+    def _reposition(self):
+        self._reposition_pending = False
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor()
+        wa      = monitor.get_workarea()
+        w, h    = self.get_size()
+        self.move(wa.x + wa.width - w - 5, wa.y + 5)
+        return False
+
+    # --- slot management ---
+
+    def add_slot(self, pixbuf: GdkPixbuf.Pixbuf,
+                 on_press) -> tuple[Gtk.EventBox, Gtk.Image]:
+        """
+        Append a 22×22 icon button to the panel.
+        on_press(widget, Gdk.EventButton) is called for any mouse button.
+        Returns (EventBox, Image) so the caller can update the image later.
+        """
+        pb  = pixbuf.scale_simple(ICON_SIZE, ICON_SIZE, GdkPixbuf.InterpType.BILINEAR)
+        img = Gtk.Image.new_from_pixbuf(pb)
+
+        ebox = Gtk.EventBox()
+        ebox.add(img)
+        ebox.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK |
+            Gdk.EventMask.ENTER_NOTIFY_MASK |
+            Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        ebox.connect('button-press-event', on_press)
+        ebox.connect('enter-notify-event',
+                     lambda w, e: (img.set_opacity(0.65), False)[1])
+        ebox.connect('leave-notify-event',
+                     lambda w, e: (img.set_opacity(1.0),  False)[1])
+        ebox.connect('realize',
+                     lambda w: w.get_window().set_cursor(_hand_cursor()))
+
+        self._box.pack_start(ebox, False, False, 0)
+        self._box.show_all()
+        return ebox, img
+
+    def remove_slot(self, ebox: Gtk.EventBox):
+        self._box.remove(ebox)
+        self._box.show_all()
+
+
+# ---------------------------------------------------------------------------
+# Host icon — sni-host's own slot in the TrayWindow
 # ---------------------------------------------------------------------------
 
 class HostTrayIcon:
-    """sni-host's own GtkStatusIcon — black signal-bars icon, right-click menu."""
+    """sni-host's own icon + right-click menu inside TrayWindow."""
 
-    def __init__(self, app: 'Application'):
-        self._app = app
-        self._pixbuf = _make_host_pixbuf()
-
-        self._icon = Gtk.StatusIcon()
-        self._icon.set_from_pixbuf(self._pixbuf)
-        self._icon.set_title('sni-host')
-        self._icon.set_tooltip_text(f'sni-host v{VERSION} — AppIndicator host')
-        self._icon.connect('popup-menu', self._on_popup_menu)
-        self._icon.connect('activate',   self._on_activate)
-        self._icon.set_visible(True)
+    def __init__(self, app: 'Application', tray: TrayWindow):
+        self._app  = app
+        self._tray = tray
+        self._ebox, self._img = tray.add_slot(_make_host_pixbuf(), self._on_press)
+        self._ebox.set_tooltip_text(f'sni-host v{VERSION}')
 
     def refresh_tooltip(self):
-        n = self._app.item_count()
+        n   = self._app.item_count()
         tip = f'sni-host v{VERSION}\n{n} registered item{"s" if n != 1 else ""}'
-        self._icon.set_tooltip_text(tip)
+        self._ebox.set_tooltip_text(tip)
+
+    # --- menu ---
 
     def _build_menu(self) -> Gtk.Menu:
         menu = Gtk.Menu()
 
-        def _label(text, bold=False, sensitive=False):
-            item = Gtk.MenuItem()
+        def _info(text, bold=False):
+            item  = Gtk.MenuItem()
             label = Gtk.Label(xalign=0)
-            if bold:
-                label.set_markup(f'<b>{GLib.markup_escape_text(text)}</b>')
-            else:
-                label.set_text(text)
+            label.set_markup(
+                f'<b>{GLib.markup_escape_text(text)}</b>' if bold else
+                GLib.markup_escape_text(text))
             item.add(label)
-            item.set_sensitive(sensitive)
+            item.set_sensitive(False)
             return item
 
-        menu.append(_label(f'sni-host  v{VERSION}', bold=True))
-        menu.append(_label('AppIndicator / SNI host daemon'))
-        menu.append(_label(f'PID: {os.getpid()}'))
+        menu.append(_info(f'sni-host  v{VERSION}', bold=True))
+        menu.append(_info('AppIndicator / SNI host daemon'))
+        menu.append(_info(f'PID: {os.getpid()}'))
         menu.append(Gtk.SeparatorMenuItem())
 
-        items = self._app.registered_item_names()
-        count_item = _label(
-            f'Registered items: {len(items)}',
-            bold=True,
-        )
-        menu.append(count_item)
-
-        for name in items:
-            row = _label(f'  ●  {name}')  # ● indented
-            menu.append(row)
+        names = self._app.registered_item_names()
+        menu.append(_info(f'Registered items: {len(names)}', bold=True))
+        for name in names:
+            menu.append(_info(f'  ●  {name}'))
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        restart_item = Gtk.MenuItem(label='Restart')
-        restart_item.connect('activate', self._on_restart)
-        menu.append(restart_item)
+        restart = Gtk.MenuItem(label='Restart')
+        restart.connect('activate', lambda *_: self._do_restart())
+        menu.append(restart)
 
-        quit_item = Gtk.MenuItem(label='Quit')
-        quit_item.connect('activate', self._on_quit)
-        menu.append(quit_item)
+        quit_ = Gtk.MenuItem(label='Quit')
+        quit_.connect('activate', lambda *_: self._app.quit())
+        menu.append(quit_)
 
         menu.show_all()
         return menu
 
-    def _on_activate(self, icon):
-        # Left-click also opens the menu
-        menu = self._build_menu()
-        menu.popup(None, None,
-                   Gtk.StatusIcon.position_menu,
-                   icon, 1, Gtk.get_current_event_time())
+    def _on_press(self, widget, event):
+        if event.button in (1, 3):
+            self._build_menu().popup_at_pointer(event)
+        return True
 
-    def _on_popup_menu(self, icon, button, time):
-        menu = self._build_menu()
-        menu.popup(None, None,
-                   Gtk.StatusIcon.position_menu,
-                   icon, button, time)
-
-    def _on_restart(self, _item):
+    def _do_restart(self):
         log.info('Restarting…')
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-    def _on_quit(self, _item):
-        log.info('Quit requested from tray menu')
-        self._app.quit()
-
     def destroy(self):
-        self._icon.set_visible(False)
+        self._tray.remove_slot(self._ebox)
 
 
 # ---------------------------------------------------------------------------
@@ -207,26 +332,20 @@ class StatusNotifierWatcher(dbus.service.Object):
 
     def __init__(self, bus, app):
         super().__init__(bus, WATCHER_OBJ_PATH)
-        self._bus = bus
-        self._app = app
+        self._bus  = bus
+        self._app  = app
         self._items: dict[str, tuple[str, str]] = {}
         self._hosts: list[str] = []
-        self._host_registered = False
-
-    # --- methods ---
+        self._host_registered  = False
 
     @dbus.service.method(WATCHER_IFACE, in_signature='s', out_signature='',
                          sender_keyword='sender')
     def RegisterStatusNotifierItem(self, service, sender=None):
         if service.startswith('/'):
-            obj_path = service
-            bus_name = sender
+            obj_path, bus_name = service, sender
         else:
-            bus_name = service
-            obj_path = ITEM_DEFAULT_PATH
-
+            bus_name, obj_path = service, ITEM_DEFAULT_PATH
         log.info('RegisterStatusNotifierItem: bus=%s path=%s', bus_name, obj_path)
-
         if bus_name not in self._items:
             self._items[bus_name] = (bus_name, obj_path)
             self.StatusNotifierItemRegistered(bus_name)
@@ -242,8 +361,6 @@ class StatusNotifierWatcher(dbus.service.Object):
         if not self._host_registered:
             self._host_registered = True
             self.StatusNotifierHostRegistered()
-
-    # --- properties ---
 
     @dbus.service.method(PROPS_IFACE, in_signature='ss', out_signature='v')
     def Get(self, interface, prop):
@@ -262,25 +379,17 @@ class StatusNotifierWatcher(dbus.service.Object):
             'ProtocolVersion': dbus.Int32(0),
         }
 
-    # --- signals ---
+    @dbus.service.signal(WATCHER_IFACE, signature='s')
+    def StatusNotifierItemRegistered(self, service): pass
 
     @dbus.service.signal(WATCHER_IFACE, signature='s')
-    def StatusNotifierItemRegistered(self, service):
-        pass
-
-    @dbus.service.signal(WATCHER_IFACE, signature='s')
-    def StatusNotifierItemUnregistered(self, service):
-        pass
+    def StatusNotifierItemUnregistered(self, service): pass
 
     @dbus.service.signal(WATCHER_IFACE)
-    def StatusNotifierHostRegistered(self):
-        pass
+    def StatusNotifierHostRegistered(self): pass
 
     @dbus.service.signal(WATCHER_IFACE)
-    def StatusNotifierHostUnregistered(self):
-        pass
-
-    # --- internal ---
+    def StatusNotifierHostUnregistered(self): pass
 
     def _on_name_owner_changed(self, new_owner):
         if new_owner:
@@ -294,49 +403,25 @@ class StatusNotifierWatcher(dbus.service.Object):
 
 
 # ---------------------------------------------------------------------------
-# Per-item tray icon
+# Per-item slot in the TrayWindow
 # ---------------------------------------------------------------------------
 
-def _argb_pixmaps_to_pixbuf(pixmaps):
-    """Convert SNI ARGB pixmap list [(w, h, bytes), ...] to GdkPixbuf."""
-    best = None
-    for (w, h, data) in pixmaps:
-        w, h = int(w), int(h)
-        if w <= 0 or h <= 0:
-            continue
-        raw = bytes(data)
-        if len(raw) < w * h * 4:
-            continue
-        # ARGB (network order) -> RGBA
-        rgba = bytearray(len(raw))
-        for i in range(0, len(raw), 4):
-            a, r, g, b = raw[i], raw[i+1], raw[i+2], raw[i+3]
-            rgba[i] = r; rgba[i+1] = g; rgba[i+2] = b; rgba[i+3] = a
-        pb = GdkPixbuf.Pixbuf.new_from_data(
-            bytes(rgba), GdkPixbuf.Colorspace.RGB, True, 8, w, h, w * 4)
-        if best is None or w > best.get_width():
-            best = pb.copy()
-    return best
-
-
 class TrayItem:
-    """Wraps one registered StatusNotifierItem as a GtkStatusIcon."""
+    """One registered StatusNotifierItem rendered as a slot in TrayWindow."""
 
-    def __init__(self, bus, bus_name, obj_path, app):
+    def __init__(self, bus, bus_name: str, obj_path: str,
+                 app: 'Application', tray: TrayWindow):
         self._bus      = bus
         self._bus_name = bus_name
         self._obj_path = obj_path
         self._app      = app
+        self._tray     = tray
         self._menu_client = None
         self._proxy    = None
         self._props    = None
 
-        self._icon = Gtk.StatusIcon()
-        self._icon.set_title(bus_name)
-        self._icon.connect('activate',   self._on_activate)
-        self._icon.connect('popup-menu', self._on_popup_menu)
-        self._icon.set_visible(True)
-
+        self._ebox, self._img = tray.add_slot(_make_fallback_pixbuf(), self._on_press)
+        self._ebox.set_tooltip_text(bus_name)
         self._connect()
 
     def _connect(self):
@@ -348,7 +433,8 @@ class TrayItem:
             self._refresh_menu()
             self._subscribe_signals()
         except Exception as e:
-            log.warning('Could not connect to %s %s: %s', self._bus_name, self._obj_path, e)
+            log.warning('Could not connect to %s %s: %s',
+                        self._bus_name, self._obj_path, e)
 
     def _get_prop(self, name, default=None):
         try:
@@ -356,19 +442,27 @@ class TrayItem:
         except Exception:
             return default
 
-    def _refresh_icon(self):
+    def _load_icon_pixbuf(self) -> GdkPixbuf.Pixbuf | None:
         icon_name = str(self._get_prop('IconName', '') or '')
         if icon_name:
-            self._icon.set_from_icon_name(icon_name)
-            return
+            pb = _load_named_icon(icon_name)
+            if pb:
+                return pb
         pixmaps = self._get_prop('IconPixmap')
         if pixmaps:
-            pb = _argb_pixmaps_to_pixbuf(pixmaps)
-            if pb:
-                pb = pb.scale_simple(ICON_SIZE, ICON_SIZE, GdkPixbuf.InterpType.BILINEAR)
-                self._icon.set_from_pixbuf(pb)
-                return
-        self._icon.set_from_icon_name('application-x-executable')
+            return _argb_pixmaps_to_pixbuf(pixmaps)
+        return None
+
+    def _refresh_icon(self):
+        pb = self._load_icon_pixbuf()
+        if pb is None:
+            pb = _make_fallback_pixbuf()
+        pb = pb.scale_simple(ICON_SIZE, ICON_SIZE, GdkPixbuf.InterpType.BILINEAR)
+        self._img.set_from_pixbuf(pb)
+
+        title = str(self._get_prop('Title', '') or self._bus_name)
+        self._ebox.set_tooltip_text(title)
+        log.debug('%s: icon refreshed', self._bus_name)
 
     def _refresh_menu(self):
         menu_path = str(self._get_prop('Menu', '') or '')
@@ -377,7 +471,7 @@ class TrayItem:
         try:
             self._menu_client = DbusmenuGtk3.Client.new(self._bus_name, menu_path)
         except Exception as e:
-            log.warning('Could not create menu client for %s: %s', self._bus_name, e)
+            log.warning('Menu client failed for %s: %s', self._bus_name, e)
 
     def _subscribe_signals(self):
         obj = self._bus.get_object(self._bus_name, self._obj_path)
@@ -389,36 +483,35 @@ class TrayItem:
         GLib.idle_add(self._refresh_icon)
 
     def _on_new_status(self, status, *_):
-        GLib.idle_add(self._icon.set_visible, str(status) != 'Passive')
+        GLib.idle_add(self._ebox.set_visible, str(status) != 'Passive')
 
     def _on_new_title(self, *_):
         title = str(self._get_prop('Title', '') or self._bus_name)
-        GLib.idle_add(self._icon.set_title, title)
+        GLib.idle_add(self._ebox.set_tooltip_text, title)
 
-    def _on_activate(self, icon):
-        try:
-            self._proxy.Activate(0, 0)
-        except Exception as e:
-            log.debug('Activate failed: %s', e)
-
-    def _on_popup_menu(self, icon, button, time):
-        if self._menu_client:
-            root = self._menu_client.get_root()
-            if root:
-                menu = self._menu_client.menuitem_get_submenu(root)
-                if menu:
-                    menu.popup(None, None,
-                               Gtk.StatusIcon.position_menu,
-                               icon, button, time)
-                    return
-        try:
-            self._proxy.ContextMenu(0, 0)
-        except Exception:
-            pass
+    def _on_press(self, widget, event):
+        if event.button == 1:
+            try:
+                self._proxy.Activate(0, 0)
+            except Exception as e:
+                log.debug('Activate failed: %s', e)
+        elif event.button == 3:
+            if self._menu_client:
+                root = self._menu_client.get_root()
+                if root:
+                    menu = self._menu_client.menuitem_get_submenu(root)
+                    if menu:
+                        menu.popup_at_pointer(event)
+                        return True
+            try:
+                self._proxy.ContextMenu(0, 0)
+            except Exception:
+                pass
+        return True
 
     def destroy(self):
-        self._icon.set_visible(False)
-        self._icon = None
+        self._tray.remove_slot(self._ebox)
+        self._ebox = None
 
 
 # ---------------------------------------------------------------------------
@@ -428,8 +521,9 @@ class TrayItem:
 class Application:
     def __init__(self):
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-        self._bus           = dbus.SessionBus()
+        self._bus   = dbus.SessionBus()
         self._items: dict[str, TrayItem] = {}
+        self._tray: TrayWindow | None = None
         self._host_icon: HostTrayIcon | None = None
         self._loop: GLib.MainLoop | None = None
 
@@ -463,7 +557,8 @@ class Application:
         log.info('Watcher:  %s', WATCHER_BUS_NAME)
         log.info('Host:     %s', host_name)
 
-        self._host_icon = HostTrayIcon(self)
+        self._tray      = TrayWindow()
+        self._host_icon = HostTrayIcon(self, self._tray)
 
         self._loop = GLib.MainLoop()
         _signal.signal(_signal.SIGINT,  lambda *_: self._loop.quit())
@@ -474,7 +569,8 @@ class Application:
         if bus_name in self._items:
             return
         log.info('Item registered: %s at %s', bus_name, obj_path)
-        self._items[bus_name] = TrayItem(self._bus, bus_name, obj_path, self)
+        self._items[bus_name] = TrayItem(
+            self._bus, bus_name, obj_path, self, self._tray)
         if self._host_icon:
             self._host_icon.refresh_tooltip()
 

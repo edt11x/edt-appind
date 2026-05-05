@@ -22,9 +22,19 @@ default.
   to RGBA before passing to `GdkPixbuf`.
 - The watcher exits with status 1 if `org.kde.StatusNotifierWatcher` is
   already owned (prevents duplicate instances).
-- **sni-host's own tray icon** is drawn with `cairo` (black bg, three white
-  rounded signal bars) via `Gdk.pixbuf_get_from_surface`.  Uses `HostTrayIcon`
-  class with a dynamically-built `Gtk.Menu` on each right/left-click.
+- **No `GtkStatusIcon`**: the original design used `GtkStatusIcon` but it
+  requires `_NET_SYSTEM_TRAY_S0` to be owned by a running tray.  Neither GNOME
+  Shell nor default XFCE provides one, so icons silently vanished.  Replaced
+  with a self-owned frameless `Gtk.Window` (`TrayWindow`) that positions itself
+  at the top-right of the primary monitor workarea via `Gdk.Monitor.get_workarea()`.
+- **`TrayWindow`** is a frameless, always-on-top, skip-taskbar window with a
+  dark rounded CSS background.  Each icon is a `Gtk.EventBox` + `Gtk.Image`
+  with opacity-based hover feedback.  `size-allocate` → `idle_add` keeps it
+  right-aligned as slots are added/removed.
+- **`HostTrayIcon`** owns the first slot (signal-bars icon); `TrayItem` owns
+  subsequent slots (one per registered SNI app).
+- **`popup_at_pointer(event)`** is used for all menus (replaces the old
+  `StatusIcon.position_menu` function which only works with GtkStatusIcon).
 - **Restart** is implemented as `os.execv(sys.executable, [sys.executable] + sys.argv)`,
   replacing the process in-place while preserving all CLI arguments.
 
@@ -42,6 +52,11 @@ default.
   be scoped more narrowly in future.
 - The host tray menu rebuilds from scratch on every open; acceptable for the
   expected item count but could be optimized with incremental updates.
+- Window positioning uses `Gdk.Monitor.get_workarea()` (respects panel struts)
+  and `Gtk.Window.move()` — the latter is ignored on Wayland compositors.
+  Future fix: use `gtk-layer-shell` for Wayland support.
+- Tested desktop: XFCE, X11, Fedora 43.  Confirmed `_NET_SYSTEM_TRAY_S0` was
+  absent, which is why `GtkStatusIcon` was silent.
 
 ## Files
 

@@ -14,14 +14,22 @@ Without this (or a GNOME Shell extension), Dropbox shows:
 
 1. Registers the well-known DBus name `org.kde.StatusNotifierWatcher`.
 2. Registers itself as `org.kde.StatusNotifierHost-<pid>`.
-3. **sni-host's own tray icon** — a black icon with three white signal bars
-   appears in the system tray.  Left-click or right-click opens a menu showing
-   version, PID, all registered items, and **Restart** / **Quit** actions.
-4. When an SNI application (like Dropbox) calls `RegisterStatusNotifierItem`,
-   it creates a `GtkStatusIcon` in the X11 system tray using the app's icon
-   and connects a `libdbusmenu-gtk3` context menu.
-5. Watches for `NewIcon` / `NewStatus` / `NewTitle` signals and updates the
-   tray icon live.
+3. **sni-host's own panel window** — a small frameless always-on-top window
+   with a dark background appears at the top-right corner of the primary
+   monitor's work area.  It contains a black signal-bars icon for sni-host
+   itself plus one slot per registered SNI app.
+4. Left-click or right-click the sni-host icon for a menu showing version,
+   PID, all registered items, and **Restart** / **Quit** actions.
+5. When an SNI application (like Dropbox) calls `RegisterStatusNotifierItem`,
+   a new icon slot is appended to the panel using the app's icon and a
+   `libdbusmenu-gtk3` context menu.
+6. Left-click an app icon calls `Activate`; right-click shows its dbusmenu.
+7. Watches `NewIcon` / `NewStatus` / `NewTitle` signals and updates live.
+
+> **Why not GtkStatusIcon?**  `GtkStatusIcon` requires a running X11 system
+> tray (the `_NET_SYSTEM_TRAY_S0` EWMH selection).  Neither GNOME Shell nor
+> default XFCE sessions provide one, so icons would silently disappear.
+> sni-host's own panel window bypasses this entirely.
 
 ## Requirements
 
@@ -72,12 +80,22 @@ dropbox stop && dropbox start
 | `sni-host.service` | systemd user service unit |
 | `install.sh` | Installs the above and enables the service |
 
-## sni-host tray menu
+## Panel window and menu
 
-Right-click (or left-click) the black signal-bars icon to open the menu:
+sni-host opens a small frameless panel at the top-right corner of the primary
+monitor, positioned inside the work area (respects any existing panel struts).
 
 ```
-sni-host  v1.0              ← bold header
+┌─────────────────────────┐
+│ ▐█▌  ◉  ◉              │  ← sni-host icon + one slot per registered app
+└─────────────────────────┘
+  top-right of workarea
+```
+
+Right-click or left-click the **sni-host icon** (three signal bars):
+
+```
+sni-host  v1.1              ← bold header
 AppIndicator / SNI host daemon
 PID: 12345
 ─────────────────────────
@@ -88,11 +106,13 @@ Restart                     ← replaces process in-place (os.execv)
 Quit
 ```
 
-The tooltip on the icon shows the version and current item count.
+The icon tooltip shows the version and current item count.  Hovering any icon
+dims it slightly to indicate it is clickable.
 
 ## Limitations
 
-- Uses `GtkStatusIcon`, which is deprecated in GTK 3 (still functional) and
-  absent in GTK 4.  Works on X11; not tested under XWayland.
-- Tested on Fedora 43 with GNOME and the X11 session.
-- No multi-item icon ordering; icons appear in registration order.
+- X11 only.  Under a pure Wayland session `window.move()` is not honoured;
+  the window will appear but may not be in the top-right corner.
+  `gtk-layer-shell` (installed on Fedora 43) could fix this in future.
+- Tested on Fedora 43 with XFCE, X11 session.
+- Icon ordering follows registration order; no drag-to-reorder yet.
