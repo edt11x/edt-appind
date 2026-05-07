@@ -51,6 +51,20 @@ default.
 - **Restart** is implemented as `os.execv(sys.executable, [sys.executable] + sys.argv)`,
   replacing the process in-place while preserving all CLI arguments.
 
+- **Notification daemon**: on startup the daemon tries to claim
+  `org.freedesktop.Notifications` (the standard freedesktop desktop-notification
+  bus name).  If successful it creates a `NotificationWindow` — a second
+  frameless panel positioned directly below `TrayWindow` — that shows a
+  scrollable, dismissible list of all captured notifications.  Left-clicking the
+  host tray icon toggles `NotificationWindow` open/closed.  Each row has a ✕
+  button; a "Clear all" button in the header dismisses every row at once.
+  Rows fire `NotificationClosed(id, reason=2)` signals back to senders so
+  clients know the notification was dismissed.  If another daemon (dunst,
+  notify-osd, GNOME's built-in) already owns the bus name, a warning is logged
+  and the notification feature is silently disabled — the SNI/tray functionality
+  is unaffected.  `expire_timeout > 0` is respected (auto-dismiss after N ms);
+  `expire_timeout ≤ 0` keeps the notification until the user dismisses it.
+
 ## Known issues / next steps
 
 - `GtkStatusIcon` is deprecated since GTK 3.14 and will eventually be removed

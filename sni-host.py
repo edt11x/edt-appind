@@ -37,8 +37,11 @@ def _parse_args():
             'applications using the StatusNotifierItem / AppIndicator protocol\n'
             '(e.g. Dropbox) can display tray icons.\n\n'
             'sni-host shows its own icon in a small frameless panel window at the\n'
-            'top-right corner of the primary monitor.  Left-click or right-click\n'
-            'the icon for a menu with app info, registered items, Restart, and Quit.\n\n'
+            'top-right corner of the primary monitor.  Left-click the host icon to\n'
+            'toggle the notification panel; right-click for app info, Restart, Quit.\n\n'
+            'Also claims org.freedesktop.Notifications to capture desktop\n'
+            'notifications in a dismissible list (skipped if another daemon is\n'
+            'already running).\n\n'
             'Intended to run as a background daemon via a systemd user service\n'
             '(see sni-host.service).'
         ),
@@ -63,6 +66,10 @@ ITEM_DEFAULT_PATH = '/StatusNotifierItem'
 HOST_BUS_PREFIX   = 'org.kde.StatusNotifierHost'
 
 PROPS_IFACE       = 'org.freedesktop.DBus.Properties'
+
+NOTIF_BUS_NAME    = 'org.freedesktop.Notifications'
+NOTIF_OBJ_PATH    = '/org/freedesktop/Notifications'
+NOTIF_IFACE       = 'org.freedesktop.Notifications'
 
 ICON_SIZE = 22   # px, each icon square
 PAD       = 4    # px, padding around icon row inside panel window
@@ -123,12 +130,13 @@ def _make_fallback_pixbuf(size=ICON_SIZE) -> GdkPixbuf.Pixbuf:
     return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
 
 
-def _load_named_icon(name: str, extra_path: str = '') -> GdkPixbuf.Pixbuf | None:
+def _load_named_icon(name: str, size: int = ICON_SIZE,
+                     extra_path: str = '') -> GdkPixbuf.Pixbuf | None:
     theme = Gtk.IconTheme.get_default()
     if extra_path and extra_path not in theme.get_search_path():
         theme.prepend_search_path(extra_path)
     try:
-        return theme.load_icon(name, ICON_SIZE, Gtk.IconLookupFlags.FORCE_SIZE)
+        return theme.load_icon(name, size, Gtk.IconLookupFlags.FORCE_SIZE)
     except GLib.Error:
         return None
 
@@ -167,6 +175,65 @@ window#sni-host-tray {
 
 # Minimum panel width so the window is never an invisible sliver.
 _PANEL_MIN_W = 80
+
+_NOTIF_W = 380   # notification panel width (px)
+
+_NOTIF_CSS = b"""
+window#sni-notif-panel {
+    background-color: #1c1c1c;
+    border: 2px solid #c07820;
+}
+.notif-header {
+    background-color: #242424;
+    padding: 4px 8px;
+    border-bottom: 1px solid #444;
+}
+.notif-header-label {
+    color: #c07820;
+    font-weight: bold;
+    font-size: 10px;
+}
+.notif-clear-btn {
+    background: transparent;
+    border: 1px solid #555;
+    color: #888;
+    padding: 2px 6px;
+    font-size: 9px;
+    min-height: 0;
+}
+.notif-clear-btn:hover {
+    background-color: #444;
+    color: #eee;
+}
+.notif-row {
+    border-bottom: 1px solid #2a2a2a;
+}
+.notif-app {
+    color: #888888;
+    font-size: 9px;
+}
+.notif-summary {
+    color: #eeeeee;
+    font-size: 11px;
+}
+.notif-body {
+    color: #aaaaaa;
+    font-size: 10px;
+}
+.notif-dismiss {
+    background: transparent;
+    border: none;
+    color: #666;
+    padding: 0 6px;
+    min-width: 0;
+    min-height: 0;
+    font-size: 12px;
+}
+.notif-dismiss:hover {
+    background-color: #444;
+    color: #eee;
+}
+"""
 
 
 class TrayWindow(Gtk.Window):
@@ -311,21 +378,224 @@ class TrayWindow(Gtk.Window):
 
 
 # ---------------------------------------------------------------------------
+# Notification panel — dismissible list of captured desktop notifications
+# ---------------------------------------------------------------------------
+
+class NotificationWindow(Gtk.Window):
+    """
+    Frameless always-on-top panel positioned just below TrayWindow that shows
+    a scrollable, dismissible list of captured org.freedesktop.Notifications.
+
+    Left-clicking the host tray icon toggles this window.  Notifications are
+    kept until the user clicks ✕ on the row or "Clear all" in the header.
+    """
+
+    def __init__(self, tray: 'TrayWindow'):
+        super().__init__()
+        self._tray = tray
+        self.set_title('sni-host-notifications')
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_accept_focus(True)
+        self.set_name('sni-notif-panel')
+        self.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(_NOTIF_CSS)
+        self.get_style_context().add_provider(
+            provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(outer)
+
+        # Header bar: title label + "Clear all" button
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        header.get_style_context().add_class('notif-header')
+
+        self._header_lbl = Gtk.Label(xalign=0)
+        self._header_lbl.get_style_context().add_class('notif-header-label')
+        header.pack_start(self._header_lbl, True, True, 0)
+
+        clear_btn = Gtk.Button(label='Clear all')
+        clear_btn.get_style_context().add_class('notif-clear-btn')
+        clear_btn.connect('clicked', lambda *_: self._clear_all())
+        header.pack_end(clear_btn, False, False, 0)
+
+        outer.pack_start(header, False, False, 0)
+
+        # Scrollable notification list — max 500 px tall before scrolling
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_width(_NOTIF_W)
+        scroll.set_max_content_height(500)
+        scroll.set_propagate_natural_height(True)
+        outer.pack_start(scroll, True, True, 0)
+
+        self._list_box = Gtk.ListBox()
+        self._list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        scroll.add(self._list_box)
+
+        self._rows: dict[int, Gtk.ListBoxRow]   = {}
+        self._dismiss_cbs: dict[int, callable]   = {}
+
+        self.connect('map-event', self._on_map)
+        self._update_header()
+
+    # --- internal helpers ---
+
+    def _update_header(self):
+        n = len(self._rows)
+        self._header_lbl.set_text(
+            f'Notifications ({n})' if n else 'Notifications')
+
+    def _on_map(self, *_):
+        gdkwin = self.get_window()
+        if gdkwin:
+            gdkwin.set_skip_taskbar_hint(True)
+        self._reposition()
+        GLib.timeout_add(500, self._reposition)
+        return False
+
+    def _reposition(self):
+        display = Gdk.Display.get_default()
+        seat    = display.get_default_seat()
+        pointer = seat.get_pointer()
+        _screen, px, py = pointer.get_position()
+        monitor = (display.get_monitor_at_point(px, py)
+                   or display.get_primary_monitor()
+                   or display.get_monitor(0))
+        wa  = monitor.get_workarea()
+        w   = max(self.get_allocated_width(), _NOTIF_W)
+        x   = wa.x + wa.width - w - 5
+        tx, ty = self._tray.get_position()
+        th     = self._tray.get_allocated_height()
+        y      = (ty + th + 4) if th > 0 else (wa.y + 44)
+        self.move(x, y)
+        log.debug('Notif panel requested position (%d, %d)', x, y)
+        return False
+
+    def _build_row_content(self, nid: int, app_name: str, app_icon: str,
+                           summary: str, body: str, on_dismiss) -> Gtk.Widget:
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        hbox.set_margin_start(8)
+        hbox.set_margin_end(2)
+        hbox.set_margin_top(6)
+        hbox.set_margin_bottom(6)
+
+        icon_pb = _load_named_icon(app_icon, 16) if app_icon else None
+        if icon_pb:
+            hbox.pack_start(Gtk.Image.new_from_pixbuf(icon_pb), False, False, 0)
+
+        text_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+
+        if app_name:
+            lbl = Gtk.Label(xalign=0)
+            lbl.set_text(app_name)
+            lbl.get_style_context().add_class('notif-app')
+            text_col.pack_start(lbl, False, False, 0)
+
+        if summary:
+            lbl = Gtk.Label(xalign=0)
+            lbl.set_markup(f'<b>{GLib.markup_escape_text(str(summary))}</b>')
+            lbl.set_line_wrap(True)
+            lbl.set_max_width_chars(40)
+            lbl.get_style_context().add_class('notif-summary')
+            text_col.pack_start(lbl, False, False, 0)
+
+        if body:
+            lbl = Gtk.Label(xalign=0)
+            lbl.set_line_wrap(True)
+            lbl.set_max_width_chars(40)
+            lbl.get_style_context().add_class('notif-body')
+            try:
+                lbl.set_markup(str(body))
+            except GLib.Error:
+                lbl.set_text(str(body))
+            text_col.pack_start(lbl, False, False, 0)
+
+        hbox.pack_start(text_col, True, True, 0)
+
+        btn = Gtk.Button(label='✕')
+        btn.get_style_context().add_class('notif-dismiss')
+        btn.connect('clicked', lambda *_: on_dismiss(nid))
+        hbox.pack_end(btn, False, False, 0)
+
+        return hbox
+
+    # --- public API ---
+
+    def add_notification(self, nid: int, app_name: str, app_icon: str,
+                         summary: str, body: str, on_dismiss) -> bool:
+        """Add or replace a notification row.  Returns False (idle_add compat)."""
+        self.remove_notification(nid)   # handle replaces_id: replace in-place
+
+        self._dismiss_cbs[nid] = on_dismiss
+        content = self._build_row_content(
+            nid, app_name, app_icon, summary, body, on_dismiss)
+        row = Gtk.ListBoxRow()
+        row.get_style_context().add_class('notif-row')
+        row.add(content)
+        self._list_box.prepend(row)     # newest at top
+        row.show_all()
+        self._rows[nid] = row
+        self._update_header()
+
+        if not self.get_visible():
+            self.show_all()
+        GLib.idle_add(self._reposition)
+        return False
+
+    def remove_notification(self, nid: int):
+        row = self._rows.pop(nid, None)
+        self._dismiss_cbs.pop(nid, None)
+        if row is None:
+            return
+        self._list_box.remove(row)
+        row.destroy()
+        self._update_header()
+        if not self._rows:
+            self.hide()
+
+    def _clear_all(self):
+        for nid, cb in list(self._dismiss_cbs.items()):
+            cb(nid)
+
+    def toggle(self):
+        if self.get_visible():
+            self.hide()
+        elif self._rows:
+            self.show_all()
+            GLib.idle_add(self._reposition)
+
+    def count(self) -> int:
+        return len(self._rows)
+
+
+# ---------------------------------------------------------------------------
 # Host icon — sni-host's own slot in the TrayWindow
 # ---------------------------------------------------------------------------
 
 class HostTrayIcon:
     """sni-host's own icon + right-click menu inside TrayWindow."""
 
-    def __init__(self, app: 'Application', tray: TrayWindow):
-        self._app  = app
-        self._tray = tray
+    def __init__(self, app: 'Application', tray: TrayWindow,
+                 notif_window: 'NotificationWindow | None' = None):
+        self._app          = app
+        self._tray         = tray
+        self._notif_window = notif_window
         self._ebox, self._img = tray.add_slot(_make_host_pixbuf(), self._on_press)
         self._ebox.set_tooltip_text(f'sni-host v{VERSION}')
 
     def refresh_tooltip(self):
         n   = self._app.item_count()
         tip = f'sni-host v{VERSION}\n{n} registered item{"s" if n != 1 else ""}'
+        if self._notif_window is not None:
+            nc = self._notif_window.count()
+            if nc:
+                tip += f'\n{nc} pending notification{"s" if nc != 1 else ""}'
+        tip += '\nLeft-click: toggle notifications\nRight-click: menu'
         self._ebox.set_tooltip_text(tip)
 
     # --- menu ---
@@ -367,7 +637,9 @@ class HostTrayIcon:
         return menu
 
     def _on_press(self, widget, event):
-        if event.button in (1, 3):
+        if event.button == 1 and self._notif_window is not None:
+            self._notif_window.toggle()
+        elif event.button in (1, 3):
             self._build_menu().popup_at_pointer(event)
         return True
 
@@ -459,6 +731,91 @@ class StatusNotifierWatcher(dbus.service.Object):
 
 
 # ---------------------------------------------------------------------------
+# Notification DBus service  (org.freedesktop.Notifications)
+# ---------------------------------------------------------------------------
+
+class NotificationDaemon(dbus.service.Object):
+    """
+    Claims org.freedesktop.Notifications and routes incoming Notify calls to
+    NotificationWindow.  Raises dbus.exceptions.NameExistsException on __init__
+    if another notification daemon already owns the bus name.
+    """
+
+    def __init__(self, bus, notif_window: NotificationWindow):
+        self._notif_bus_name = dbus.service.BusName(
+            NOTIF_BUS_NAME, bus,
+            allow_replacement=False,
+            replace_existing=False,
+            do_not_queue=True,
+        )
+        super().__init__(self._notif_bus_name, NOTIF_OBJ_PATH)
+        self._win      = notif_window
+        self._next_id  = 1
+        self._timers: dict[int, int] = {}   # nid → GLib source id
+
+    @dbus.service.method(NOTIF_IFACE, in_signature='', out_signature='as')
+    def GetCapabilities(self):
+        return dbus.Array(
+            ['body', 'body-markup', 'icon-static', 'persistence'],
+            signature='s')
+
+    @dbus.service.method(NOTIF_IFACE, in_signature='', out_signature='ssss')
+    def GetServerInformation(self):
+        return ('sni-host', 'sni-host', VERSION, '1.2')
+
+    @dbus.service.method(NOTIF_IFACE,
+                         in_signature='susssasa{sv}i', out_signature='u',
+                         sender_keyword='sender')
+    def Notify(self, app_name, replaces_id, app_icon, summary, body,
+               actions, hints, expire_timeout, sender=None):
+        replaces_id = int(replaces_id)
+        if replaces_id:
+            nid = replaces_id
+            if nid in self._timers:
+                GLib.source_remove(self._timers.pop(nid))
+        else:
+            nid = self._next_id
+            self._next_id += 1
+
+        log.debug('Notify [%d] from %s: %r', nid, app_name, summary)
+
+        def _dismiss(dismissed_id):
+            if dismissed_id in self._timers:
+                GLib.source_remove(self._timers.pop(dismissed_id))
+            self._win.remove_notification(dismissed_id)
+            self.NotificationClosed(dbus.UInt32(dismissed_id), dbus.UInt32(2))
+
+        def _add():
+            self._win.add_notification(
+                nid, str(app_name), str(app_icon),
+                str(summary), str(body), _dismiss)
+            return False
+
+        GLib.idle_add(_add)
+
+        expire_ms = int(expire_timeout)
+        if expire_ms > 0:
+            src = GLib.timeout_add(expire_ms, lambda: _dismiss(nid) or False)
+            self._timers[nid] = src
+
+        return dbus.UInt32(nid)
+
+    @dbus.service.method(NOTIF_IFACE, in_signature='u', out_signature='')
+    def CloseNotification(self, nid):
+        nid = int(nid)
+        if nid in self._timers:
+            GLib.source_remove(self._timers.pop(nid))
+        self._win.remove_notification(nid)
+        self.NotificationClosed(dbus.UInt32(nid), dbus.UInt32(3))
+
+    @dbus.service.signal(NOTIF_IFACE, signature='uu')
+    def NotificationClosed(self, nid, reason): pass
+
+    @dbus.service.signal(NOTIF_IFACE, signature='us')
+    def ActionInvoked(self, nid, action_key): pass
+
+
+# ---------------------------------------------------------------------------
 # Per-item slot in the TrayWindow
 # ---------------------------------------------------------------------------
 
@@ -506,7 +863,7 @@ class TrayItem:
         if status == 'NeedsAttention':
             icon_name = str(self._get_prop('AttentionIconName', '') or '')
             if icon_name:
-                pb = _load_named_icon(icon_name, theme_path)
+                pb = _load_named_icon(icon_name, extra_path=theme_path)
                 if pb:
                     return pb
             pixmaps = self._get_prop('AttentionIconPixmap')
@@ -517,7 +874,7 @@ class TrayItem:
 
         icon_name = str(self._get_prop('IconName', '') or '')
         if icon_name:
-            pb = _load_named_icon(icon_name, theme_path)
+            pb = _load_named_icon(icon_name, extra_path=theme_path)
             if pb:
                 return pb
         pixmaps = self._get_prop('IconPixmap')
@@ -640,10 +997,12 @@ class TrayItem:
 class Application:
     def __init__(self):
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-        self._bus   = dbus.SessionBus()
+        self._bus          = dbus.SessionBus()
         self._items: dict[str, TrayItem] = {}
         self._tray: TrayWindow | None = None
         self._host_icon: HostTrayIcon | None = None
+        self._notif_window: NotificationWindow | None = None
+        self._notif_daemon: NotificationDaemon | None = None
         self._loop: GLib.MainLoop | None = None
 
     def item_count(self) -> int:
@@ -677,7 +1036,18 @@ class Application:
         log.info('Host:     %s', host_name)
 
         self._tray = TrayWindow()
-        self._host_icon = HostTrayIcon(self, self._tray)
+
+        # Try to become the session notification daemon.  Fails gracefully if
+        # another daemon (e.g. dunst, notify-osd) already owns the bus name.
+        try:
+            self._notif_window = NotificationWindow(self._tray)
+            self._notif_daemon = NotificationDaemon(self._bus, self._notif_window)
+            log.info('Notification daemon: %s', NOTIF_BUS_NAME)
+        except dbus.exceptions.NameExistsException:
+            log.warning('Cannot own %s — another notification daemon is running; '
+                        'notifications will not be captured', NOTIF_BUS_NAME)
+
+        self._host_icon = HostTrayIcon(self, self._tray, self._notif_window)
         # Show after the host slot is populated so the first map-event fires
         # with a correctly-sized window, not an empty 0×0 box.
         self._tray.show_panel()
